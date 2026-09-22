@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+import requests
+import argparse
+import urllib3
+import re
+from datetime import datetime
+
+# Warnungen für selbstsignierte Zertifikate unterdrücken
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+EMBY_URL = "HIER_STEHT_DEIN_SERVER"
+EMBY_TOKEN = "HIER_STEHT_DEIN_TOKEN"
+# TOKEN IN EMBY ERZEUGEN
+USER_ID = "HIER_STEHT_DEINE_USERID"
+
+
+def fetch_movies(include_played_filter=True):
+    """
+    Holt Filme vom Emby-Server.
+    
+    include_played_filter=True  -> nur IsPlayed (gesehene Filme)
+    include_played_filter=False -> alle Filme (auch nie geschaute, angefangene)
+    """
+    url = f"{EMBY_URL}/Users/{USER_ID}/Items"
+    params = {
+        "IncludeItemTypes": "Movie",
+        "Recursive": True,
+        "Fields": (
+            "Name,ProductionYear,RunTimeTicks,UserData,"
+            "UserDataPlayCount,UserDataLastPlayedDate,ProviderIds,Overview"
+        ),
+    }
+    if include_played_filter:
+        params["Filters"] = "IsPlayed"
+
+    headers = {"X-MediaBrowser-Token": EMBY_TOKEN}
+    r = requests.get(url, params=params, headers=headers, verify=False)
+    r.raise_for_status()
+    return r.json().get("Items", [])
+
+
+def parse_iso_datetime(iso_string):
+    """
+    Wandelt ISO-8601-String (auch mit 7 Nachkommastellen + Z)
+    in datetime um und gibt Tag.Monat.Jahr HH:MM zurück.
+    Funktioniert mit Python 3.9.
+    """
+    if not iso_string:
+        return "unbekannt"
+    try:
+        # Z durch +00:00 ersetzen
+        s = iso_string.replace("Z", "+00:00")
+
+        # Falls 7 Nachkommastellen bei den Sekunden, auf 6 kürzen
+        match = re.match(
+            r"^(?P<dt>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.(?P<frac>\d{7})(?P<tz>[+-]\d{2}:\d{2})$",
+            s,
+        )
+        if match:
+            frac = match.group("frac")[:6]
+            s = f"{match.group('dt')}.{frac}{match.group('tz')}"
+
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone()
+        return dt.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return "unbekannt"
+
+
+def print_movies(items, mode="played"):
+    """
+    Gibt die Liste der Filme formatiert aus.
+    
+    mode:
+      - "played":   nur als 'gesehen' markierte Filme (Played = true)
+      - "started":  alle Filme mit Abspielposition > 0 (angefangen, auch nicht fertig)
+      - "fully":    nur 100 % geschaut
+    """
+    for item in items:
+        ud = item.get("UserData", {})
+        played = ud.get("Played", False)
+        playback_pos = ud.get("PlaybackPositionTicks", 0)
+        runtime = item.get("RunTimeTicks", 0)
+        played_pct = ud.get("PlayedPercentage")
+
+        # Filter je nach Modus
+        if mode == "played":
+            # Nur explizit als gesehen markiert
+            if not played:
+                continue
+
+        elif mode == "started":
+            # Nur Filme, die mindestens einmal angespielt wurden
+            if playback_pos == 0:
+                continue
+
+        elif mode == "fully":
+            # Nur 100 % geschaut
+            is_fully = (
+                (played_pct is not None and played_pct >= 100)
+                or (runtime > 0 and playback_pos >= runtime)
+            )
+            if not is_fully:
+                continue
+
+        last_played = parse_iso_datetime(ud.get("LastPlayedDate"))
+        title = item.get("Name", "unbekannt")
+        year = item.get("ProductionYear") or "unbekannt"
+        playcount = ud.get("PlayCount", 0)
+
+        provider_ids = item.get("ProviderIds", {}) or {}
+        imdb_id = provider_ids.get("Imdb")
+        imdb_link = f"https://www.imdb.com/title/{imdb_id}/" if imdb_id else "keine IMDb-ID"
+
+        overview = item.get("Overview") or "keine Beschreibung"
+        year_str = str(year) if year != "unbekannt" else "unbekannt"
+
+        print(f"{last_played}\t{title}\t{year_str}\t{playcount}")
+        print(f"  IMDb: {imdb_link}")
+        print(f"  Beschreibung: {overview}")
+        print()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Liste von Filmen aus Emby mit Datum, Uhrzeit, IMDb und Beschreibung"
+    )
+    parser.add_argument(
+        "--started",
+        action="store_true",
+        help="Nur angefangene Filme anzeigen (Abspielposition > 0)",
+    )
+    parser.add_argument(
+        "--fully",
+        action="store_true",
+        help="Nur 100 % geschauten Filme anzeigen",
+    )
+    args = parser.parse_args()
+
+    # Modus bestimmen
+    if args.started:
+        mode = "started"
+        # Für 'started' wollen wir alle Filme, nicht nur IsPlayed
+        items = fetch_movies(include_played_filter=False)
+    elif args.fully:
+        mode = "fully"
+        # Für 'fully' reicht IsPlayed-Filter, aber wir können auch alle holen
+        items = fetch_movies(include_played_filter=False)
+    else:
+        mode = "played"
+        # Standard: nur als 'gesehen' markierte Filme
+        items = fetch_movies(include_played_filter=True)
+
+    print_movies(items, mode=mode)
